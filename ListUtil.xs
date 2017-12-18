@@ -114,6 +114,102 @@ static enum slu_accum accum_type(SV *sv) {
 /* Magic for set_subname */
 static MGVTBL subname_vtbl;
 
+
+
+static void
+THX_xsfunc_tainted(pTHX_ CV *cv)
+{
+    croak("Original tainted called");
+}
+
+static XOP tainted_xop;
+
+static inline OP *
+tainted_pp(pTHX)
+{
+    dSP;
+    SV *sv = TOPs;
+    SvGETMAGIC(sv);
+    SETs(SvTAINTED(sv) ? &PL_sv_yes : &PL_sv_no);
+    return NORMAL;
+}
+
+static OP *
+THX_ck_entersub_args_tainted(pTHX_ OP *entersubop, GV *namegv, SV *ckobj)
+{
+    OP *pushop = NULL;
+    OP *arg = NULL;
+    OP *newop = NULL;
+
+    /* fix up argument structures */
+    entersubop = ck_entersub_args_proto(entersubop, namegv, ckobj);
+
+    /* extract the args for the custom op, and delete the remaining ops
+       NOTE: this is the *single* arg version, multi-arg is more
+       complicated, see Hash::SharedMem's THX_ck_entersub_args_hsm */
+
+    /* These comments will visualize how the op tree look like after
+       each operation. We usually start out with this: */
+    /* --> entersub( list( push, arg1, cv ) ) */
+    /* Though in rare cases it can also look like this: */
+    /* --> entersub( push, arg1, cv ) */
+
+    /* first, get the real pushop, after which comes the arg list */
+
+    /* Cast the entersub op as an op with a single child */
+    /* and get that child (the args list or pushop). */
+    pushop = cUNOPx( entersubop )->op_first;
+
+    /* At this point we're still not sure if it's the right op,
+       (because it should normally be a list() with the push inside it)
+       so we check whether it has siblings or not. The list() has no
+       siblings */
+    /* Go one layer deeper to get at the real pushop. */
+    if( !OpHAS_SIBLING( pushop ) )
+      /* Fetch the actual push op from inside the list() op */
+      pushop = cUNOPx( pushop )->op_first;
+
+    /* then extract the arg */
+    /* Get a pointer to the first arg op */
+    /* so we can attach it to the custom op later on. */
+    /* Notice "ex-rv2sv" calls are optimized away. */
+    arg = OpSIBLING( pushop );
+
+    /* --> entersub( list( push, arg1, cv ) ) + ( arg1, cv ) */
+
+    /* and prepare to delete the other ops */
+    /* Replace the first op of the arg list with the last arg op
+       (the cv op, i.e. pointer to original xs function),
+       which allows recursive deletion of all unneeded ops
+       while keeping the arg list. */
+    OpMORESIB_set( pushop, OpSIBLING( arg ) );
+    /* --> entersub( list( push, cv ) ) + ( arg1, cv ) */
+
+    /* Remove the trailing cv op from the arg list,
+       by declaring the arg to be the last sibling in the arg list. */
+    OpLASTSIB_set( arg, NULL );
+    /* --> entersub( list( push, cv ) ) */
+    /* --> arg1                         */
+
+    /* Recursively free entersubop + children,
+       as it'll be replaced by the op we return. */
+    op_free( entersubop );
+    /* --> ( arg1 ) */
+
+    /* create and return new op */
+    newop = newUNOP( OP_NULL, 0, arg );
+    /* can't do this in the new above, due to crashes pre-5.22 */
+    newop->op_type   = OP_CUSTOM;
+    newop->op_ppaddr = tainted_pp;
+    /* --> custom_op( arg1 ) */
+
+    return newop;
+}
+
+
+
+
+
 MODULE=List::Util       PACKAGE=List::Util
 
 void
@@ -1339,15 +1435,17 @@ CODE:
 OUTPUT:
     RETVAL
 
-int
-tainted(sv)
-    SV *sv
-PROTOTYPE: $
-CODE:
-    SvGETMAGIC(sv);
-    RETVAL = SvTAINTED(sv);
-OUTPUT:
-    RETVAL
+BOOT:
+{
+    CV *cv;
+    XopENTRY_set(&tainted_xop, xop_name, "tainted");
+    XopENTRY_set(&tainted_xop, xop_class, OA_UNOP);
+    Perl_custom_op_register(aTHX_ tainted_pp, &tainted_xop);
+    cv = newXSproto_portable(
+        "Scalar::Util::tainted", THX_xsfunc_tainted, __FILE__, "$"
+    );
+    cv_set_call_checker(cv, THX_ck_entersub_args_tainted, (SV*)cv);
+}
 
 void
 isvstring(sv)
